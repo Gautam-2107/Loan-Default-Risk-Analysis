@@ -1,0 +1,1389 @@
+---
+title: "Loan Default Risk Analysis and Prediction Using R"
+subtitle: "Case study: predicting loan default with Logistic Regression and Random Forest"
+author: "Gautam Raju | Introduction to Data Science Lab"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5, fig.align = "center", out.width = "95%"
+)
+
+# Install only the packages that are genuinely missing.
+# Internet access is needed the first time this report is knitted.
+required_packages <- c(
+  "dplyr", "ggplot2", "corrplot", "caret",
+  "pROC", "randomForest", "lime"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+```
+
+> **Reproducibility note:** Place `credit_risk_dataset.csv` in the same folder as this `.Rmd` file before knitting. The data path is relative, so the report runs on any computer. All tables, numbers and plots are regenerated when the report is knitted; they are not copied from the notebook. Small differences from the originally reported figures are possible if package versions differ.
+
+# Case Study Overview
+
+## Problem statement
+
+Loan default creates financial risk for lenders. This case study explores borrower and loan characteristics associated with default and builds predictive models in R to estimate whether a loan is likely to default.
+
+## Objectives
+
+- Clean and prepare the credit-risk dataset.
+- Explore default patterns through tables and visualizations.
+- Examine numerical correlations and categorical associations with loan status (chi-square tests).
+- Train and evaluate Logistic Regression and Random Forest models on a stratified 80:20 train-test split.
+- Compare the models using accuracy, precision, recall, F1-score, ROC curves and AUC.
+- Examine Random Forest feature importance.
+- Run a probability-threshold experiment and a class-weighted Random Forest experiment.
+- Use LIME to inspect one individual Random Forest prediction.
+
+# Dataset
+
+**Source:** Credit Risk Dataset on Kaggle - <https://www.kaggle.com/datasets/laotse/credit-risk-dataset>. The local file is `credit_risk_dataset.csv`.
+
+The original file has 32,581 rows and 12 variables. The target is `loan_status`, where `0` denotes non-default and `1` denotes default.
+
+| Variable | Description |
+|---|---|
+| `person_age` | Age of the borrower (years) |
+| `person_income` | Annual income of the borrower |
+| `person_home_ownership` | Home ownership status (RENT, OWN, MORTGAGE, OTHER) |
+| `person_emp_length` | Employment length (years) |
+| `loan_intent` | Purpose of the loan |
+| `loan_grade` | Loan grade (A to G) |
+| `loan_amnt` | Loan amount |
+| `loan_int_rate` | Loan interest rate (%) |
+| `loan_status` | Target: 0 = non-default, 1 = default |
+| `loan_percent_income` | Loan amount as a fraction of income |
+| `cb_person_default_on_file` | Historical default on file (Y/N) |
+| `cb_person_cred_hist_length` | Credit history length (years) |
+
+# Setup and Data Import
+
+## Load required packages
+
+All packages are loaded once, here, so every later chunk can rely on them.
+
+```{r load-packages}
+suppressPackageStartupMessages({
+  library(randomForest)
+  library(caret)
+  library(pROC)
+  library(lime)
+  library(dplyr)
+  library(ggplot2)
+  library(corrplot)
+})
+
+cat("All packages loaded successfully.\n")
+```
+
+## Import the dataset
+
+```{r import-data}
+file_path <- "credit_risk_dataset.csv"
+
+if (!file.exists(file_path)) {
+  stop("Dataset not found. Place credit_risk_dataset.csv in the same folder as this R Markdown file, then knit again.")
+}
+
+loan_data <- read.csv(file_path, stringsAsFactors = FALSE)
+
+cat("Dataset imported successfully.\n")
+cat("Rows:", nrow(loan_data), "\n")
+cat("Columns:", ncol(loan_data), "\n")
+
+head(loan_data)
+```
+
+# Data Inspection and Cleaning
+
+## Initial inspection and summary statistics
+
+```{r initial-inspection}
+# Dataset dimensions
+dim(loan_data)
+
+# Column names and data types
+str(loan_data)
+
+# Summary statistics
+summary(loan_data)
+
+# Missing values per column
+colSums(is.na(loan_data))
+
+# Target distribution
+table(loan_data$loan_status)
+```
+
+## Data quality checks: duplicates, outliers and unusual values
+
+```{r quality-checks}
+# Number of exact duplicate rows
+sum(duplicated(loan_data))
+
+# Age
+summary(loan_data$person_age)
+sum(loan_data$person_age > 80, na.rm = TRUE)
+
+# Employment length
+summary(loan_data$person_emp_length)
+sum(loan_data$person_emp_length > 50, na.rm = TRUE)
+
+# Income
+summary(loan_data$person_income)
+
+# Loan amount
+summary(loan_data$loan_amnt)
+
+# Interest rate
+summary(loan_data$loan_int_rate)
+```
+
+## Inspect unusual records
+
+```{r unusual-records}
+# People older than 80
+loan_data[
+  loan_data$person_age > 80,
+  c("person_age", "person_emp_length", "person_income")
+]
+
+# Employment length above 50 years
+loan_data[
+  !is.na(loan_data$person_emp_length) &
+    loan_data$person_emp_length > 50,
+  c("person_age", "person_emp_length", "person_income")
+]
+```
+
+## Remove duplicates and invalid values
+
+```{r cleaning}
+# Start from the original dataset
+loan_clean <- loan_data
+
+# Remove exact duplicate rows
+loan_clean <- loan_clean[!duplicated(loan_clean), ]
+
+# Remove ages above 100
+loan_clean <- loan_clean[loan_clean$person_age <= 100, ]
+
+# Remove employment lengths above 50, keeping missing values
+loan_clean <- loan_clean[
+  is.na(loan_clean$person_emp_length) |
+    loan_clean$person_emp_length <= 50,
+]
+
+cat("Cleaning completed.\n")
+cat("Original rows:", nrow(loan_data), "\n")
+cat("Cleaned rows:", nrow(loan_clean), "\n")
+cat("Columns:", ncol(loan_clean), "\n")
+```
+
+## Verify the cleaned dataset
+
+```{r verify-cleaning}
+# Confirm cleaned dimensions
+dim(loan_clean)
+
+# Remaining missing values
+colSums(is.na(loan_clean))
+
+# Check age range
+summary(loan_clean$person_age)
+
+# Check employment length
+summary(loan_clean$person_emp_length)
+
+# Confirm no duplicate rows remain
+sum(duplicated(loan_clean))
+```
+
+## Convert categorical variables into factors
+
+The target `loan_status` is given the levels `"0"` and `"1"` here, and that order is used consistently in every later chunk.
+
+```{r convert-factors}
+loan_clean$person_home_ownership <- as.factor(loan_clean$person_home_ownership)
+loan_clean$loan_intent           <- as.factor(loan_clean$loan_intent)
+loan_clean$loan_grade            <- as.factor(loan_clean$loan_grade)
+loan_clean$cb_person_default_on_file <- as.factor(loan_clean$cb_person_default_on_file)
+loan_clean$loan_status           <- factor(loan_clean$loan_status, levels = c(0, 1))
+
+str(loan_clean)
+```
+
+# Exploratory Data Analysis (EDA)
+
+## Distribution of loan default status
+
+```{r eda-status}
+# Counts
+table(loan_clean$loan_status)
+
+# Percentages
+round(prop.table(table(loan_clean$loan_status)) * 100, 2)
+
+# Plot
+ggplot(loan_clean, aes(x = loan_status)) +
+  geom_bar(fill = "steelblue") +
+  labs(
+    title = "Distribution of Loan Default Status",
+    x = "Loan Status",
+    y = "Number of Loans"
+  ) +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  theme_minimal()
+```
+
+## Default rate by loan grade
+
+```{r eda-grade}
+grade_default <- loan_clean %>%
+  group_by(loan_grade) %>%
+  summarise(
+    Total_Loans = n(),
+    Defaults = sum(loan_status == "1", na.rm = TRUE),
+    Default_Rate = mean(loan_status == "1", na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(grade_default)
+
+ggplot(grade_default, aes(x = loan_grade, y = Default_Rate)) +
+  geom_col(fill = "firebrick") +
+  labs(
+    title = "Default Rate by Loan Grade",
+    x = "Loan Grade",
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal()
+```
+
+## Income distribution by loan default status
+
+```{r eda-income}
+ggplot(loan_clean, aes(x = loan_status, y = person_income)) +
+  geom_boxplot(fill = "lightskyblue", outlier.alpha = 0.2) +
+  labs(
+    title = "Income Distribution by Loan Default Status",
+    x = "Loan Status",
+    y = "Annual Income (log scale)"
+  ) +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  scale_y_log10() +
+  theme_minimal()
+```
+
+## Loan amount distribution by default status
+
+```{r eda-loan-amount}
+ggplot(loan_clean, aes(x = loan_status, y = loan_amnt)) +
+  geom_boxplot(fill = "seagreen3", outlier.alpha = 0.2) +
+  labs(
+    title = "Loan Amount Distribution by Default Status",
+    x = "Loan Status",
+    y = "Loan Amount"
+  ) +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  theme_minimal()
+```
+
+## Default rate by loan purpose
+
+```{r eda-purpose}
+purpose_default <- loan_clean %>%
+  group_by(loan_intent) %>%
+  summarise(
+    Total_Loans = n(),
+    Defaults = sum(loan_status == "1", na.rm = TRUE),
+    Default_Rate = mean(loan_status == "1", na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(purpose_default)
+
+ggplot(purpose_default, aes(x = loan_intent, y = Default_Rate)) +
+  geom_col(fill = "darkorange") +
+  labs(
+    title = "Default Rate by Loan Purpose",
+    x = "Loan Purpose",
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Interest rate distribution by default status
+
+```{r eda-interest}
+ggplot(loan_clean, aes(x = loan_status, y = loan_int_rate)) +
+  geom_boxplot(fill = "coral", na.rm = TRUE, outlier.alpha = 0.2) +
+  labs(
+    title = "Interest Rate Distribution by Default Status",
+    x = "Loan Status",
+    y = "Interest Rate (%)"
+  ) +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  theme_minimal()
+```
+
+## Loan-to-income ratio by default status
+
+```{r eda-loan-income}
+ggplot(loan_clean, aes(x = loan_status, y = loan_percent_income)) +
+  geom_boxplot(fill = "orchid", na.rm = TRUE, outlier.alpha = 0.2) +
+  labs(
+    title = "Loan-to-Income Ratio by Default Status",
+    x = "Loan Status",
+    y = "Loan-to-Income Ratio"
+  ) +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  theme_minimal()
+```
+
+## Previous default history vs current loan default
+
+```{r eda-default-history}
+default_history <- loan_clean %>%
+  group_by(cb_person_default_on_file, loan_status) %>%
+  summarise(Count = n(), .groups = "drop")
+
+print(default_history)
+
+ggplot(
+  default_history,
+  aes(x = cb_person_default_on_file, y = Count, fill = loan_status)
+) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Previous Default History vs Current Loan Default",
+    x = "Previous Default on File",
+    y = "Number of Loans",
+    fill = "Current Loan Status"
+  ) +
+  scale_fill_manual(
+    values = c("0" = "steelblue", "1" = "firebrick"),
+    labels = c("0" = "Non-Default", "1" = "Default")
+  ) +
+  theme_minimal()
+```
+
+## Default rate by home ownership
+
+```{r eda-home}
+home_default <- loan_clean %>%
+  group_by(person_home_ownership) %>%
+  summarise(
+    Total_Loans = n(),
+    Defaults = sum(loan_status == "1", na.rm = TRUE),
+    Default_Rate = mean(loan_status == "1", na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(home_default)
+
+ggplot(home_default, aes(x = person_home_ownership, y = Default_Rate)) +
+  geom_col(fill = "cadetblue") +
+  labs(
+    title = "Default Rate by Home Ownership",
+    x = "Home Ownership",
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal()
+```
+
+## Default rate by employment length
+
+```{r eda-employment}
+emp_default <- loan_clean %>%
+  filter(!is.na(person_emp_length)) %>%
+  mutate(
+    Employment_Group = cut(
+      person_emp_length,
+      breaks = c(-1, 2, 5, 10, Inf),
+      labels = c("0-2 Years", "3-5 Years", "6-10 Years", "10+ Years")
+    )
+  ) %>%
+  group_by(Employment_Group) %>%
+  summarise(
+    Total_Loans = n(),
+    Defaults = sum(loan_status == "1", na.rm = TRUE),
+    Default_Rate = mean(loan_status == "1", na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+print(emp_default)
+
+ggplot(emp_default, aes(x = Employment_Group, y = Default_Rate)) +
+  geom_col(fill = "goldenrod") +
+  labs(
+    title = "Default Rate by Employment Length",
+    x = "Employment Length",
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal()
+```
+
+## Age distribution by loan default status
+
+```{r eda-age}
+ggplot(loan_clean, aes(x = loan_status, y = person_age)) +
+  geom_boxplot(fill = "mediumpurple", outlier.alpha = 0.2) +
+  labs(
+    title = "Age Distribution by Loan Default Status",
+    x = "Loan Status",
+    y = "Age"
+  ) +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  theme_minimal()
+```
+
+## Correlation matrix of numerical variables
+
+```{r eda-correlation-matrix}
+numeric_data <- loan_clean %>%
+  dplyr::select(
+    person_age,
+    person_income,
+    person_emp_length,
+    loan_amnt,
+    loan_int_rate,
+    loan_percent_income,
+    cb_person_cred_hist_length
+  )
+
+cor_matrix <- cor(
+  numeric_data,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+round(cor_matrix, 3)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  tl.col = "black",
+  tl.srt = 45,
+  number.cex = 0.6
+)
+```
+
+## Selected correlations among numerical variables
+
+The notebook plotted an object called `correlations` without a visible definition. It is defined here from `cor_matrix` (computed above) for a set of variable pairs, so the plot always reflects the data. The pairs shown are the ones selected for this report.
+
+```{r eda-selected-correlations}
+selected_pairs <- data.frame(
+  Var1 = c("person_age", "person_income", "loan_amnt",
+           "person_income", "person_age", "loan_int_rate"),
+  Var2 = c("cb_person_cred_hist_length", "loan_amnt", "loan_percent_income",
+           "loan_percent_income", "person_emp_length", "loan_percent_income"),
+  stringsAsFactors = FALSE
+)
+
+correlations <- data.frame(
+  Relationship = paste(selected_pairs$Var1, "vs", selected_pairs$Var2),
+  Correlation  = unname(mapply(
+    function(a, b) cor_matrix[a, b],
+    selected_pairs$Var1, selected_pairs$Var2
+  )),
+  stringsAsFactors = FALSE,
+  row.names = NULL
+)
+
+correlations$Relationship <- factor(
+  correlations$Relationship,
+  levels = rev(correlations$Relationship)
+)
+
+print(correlations)
+
+ggplot(correlations, aes(x = Relationship, y = Correlation)) +
+  geom_col() +
+  geom_text(
+    aes(
+      label = sprintf("%.3f", Correlation),
+      hjust = ifelse(Correlation < 0, 1.15, -0.15),
+      color = Correlation < 0
+    )
+  ) +
+  scale_color_manual(
+    values = c("TRUE" = "white", "FALSE" = "black"),
+    guide = "none"
+  ) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(
+    limits = c(-0.4, 1.0),
+    expand = expansion(mult = c(0.02, 0.12))
+  ) +
+  labs(
+    title = "Selected Correlations Among Numerical Variables",
+    x = NULL,
+    y = "Pearson Correlation (r)"
+  ) +
+  theme_minimal() +
+  theme(plot.margin = ggplot2::margin(10, 35, 10, 10))
+```
+
+# Statistical Analysis and Data Preparation
+
+## Missing-value treatment: preliminary median imputation
+
+Two variables contain missing values: `person_emp_length` and `loan_int_rate`. This chunk fills them with the **full-data** median on a separate copy (`loan_imputed`) so that descriptive statistics and the chi-square tests can use every row. It is **not** used for modelling: the models use training-set medians only (see the Logistic Regression section) to avoid information leaking from the test set.
+
+```{r missing-values}
+# Create a separate dataset for missing-value treatment
+loan_imputed <- loan_clean
+
+# Check missing values before treatment
+cat("Missing values before treatment:\n")
+print(colSums(is.na(loan_imputed)))
+
+# 1. Fill missing employment length using the median
+employment_median_all <- median(loan_imputed$person_emp_length, na.rm = TRUE)
+loan_imputed$person_emp_length[is.na(loan_imputed$person_emp_length)] <-
+  employment_median_all
+
+# 2. Fill missing interest rate using the median
+interest_median_all <- median(loan_imputed$loan_int_rate, na.rm = TRUE)
+loan_imputed$loan_int_rate[is.na(loan_imputed$loan_int_rate)] <-
+  interest_median_all
+
+# Check missing values after treatment
+cat("\nMissing values after treatment:\n")
+print(colSums(is.na(loan_imputed)))
+
+cat("\nDataset dimensions after imputation:\n")
+print(dim(loan_imputed))
+
+cat("\nMedian employment length used:", employment_median_all, "\n")
+cat("Median interest rate used:", interest_median_all, "\n")
+```
+
+```{r missing-values-check}
+# Confirm no missing values remain
+stopifnot(sum(is.na(loan_imputed)) == 0)
+
+# Confirm duplicate rows have not been introduced
+cat("Duplicate rows:", sum(duplicated(loan_imputed)), "\n")
+
+# Final structure
+str(loan_imputed)
+
+# Final summary
+summary(loan_imputed)
+
+cat("\nMissing-value treatment completed successfully.\n")
+```
+
+## Chi-square tests of association
+
+Each categorical predictor is tested against `loan_status`. A small p-value indicates an association, not causation. Some cells (for example loan grade G and home ownership OTHER) are small, so those results should be read with care.
+
+```{r chi-square}
+# Variables to test against loan default
+categorical_variables <- c(
+  "loan_grade",
+  "loan_intent",
+  "person_home_ownership",
+  "cb_person_default_on_file"
+)
+
+# Store results
+chi_results <- data.frame(
+  Variable = character(),
+  Chi_Square = numeric(),
+  Degrees_of_Freedom = integer(),
+  P_Value = numeric(),
+  Conclusion = character(),
+  stringsAsFactors = FALSE
+)
+
+# Run each chi-square test
+for (variable in categorical_variables) {
+
+  contingency_table <- table(
+    loan_imputed[[variable]],
+    loan_imputed$loan_status
+  )
+
+  test_result <- chisq.test(contingency_table)
+
+  conclusion <- if (test_result$p.value < 0.05) {
+    "Statistically significant association"
+  } else {
+    "No statistically significant association"
+  }
+
+  chi_results <- rbind(
+    chi_results,
+    data.frame(
+      Variable = variable,
+      Chi_Square = unname(test_result$statistic),
+      Degrees_of_Freedom = unname(test_result$parameter),
+      P_Value = test_result$p.value,
+      Conclusion = conclusion,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+# Display results
+chi_results$Chi_Square <- round(chi_results$Chi_Square, 3)
+chi_results$P_Value <- signif(chi_results$P_Value, 4)
+
+print(chi_results, row.names = FALSE)
+```
+
+## Train-test split: 80:20 stratified sampling
+
+The split is made on `loan_clean` (before any imputation), so no test-set information is used to fill missing values.
+
+```{r train-test-split}
+model_data <- loan_clean
+
+# Ensure target has the correct class order
+model_data$loan_status <- factor(model_data$loan_status, levels = c("0", "1"))
+
+# Reproducible 80:20 stratified split
+set.seed(123)
+
+train_index <- createDataPartition(
+  model_data$loan_status,
+  p = 0.80,
+  list = FALSE
+)
+
+train_data <- model_data[train_index, ]
+test_data  <- model_data[-train_index, ]
+
+# Verify split
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows:", nrow(test_data), "\n")
+
+cat("\nTraining target distribution (%):\n")
+print(round(prop.table(table(train_data$loan_status)) * 100, 2))
+
+cat("\nTesting target distribution (%):\n")
+print(round(prop.table(table(test_data$loan_status)) * 100, 2))
+
+cat("\nTrain/test split completed.\n")
+```
+
+# Machine Learning Models
+
+## Prepare data and train Logistic Regression
+
+Missing values are filled with medians calculated from the **training** data only, and the same values are applied to the test data.
+
+```{r logistic-train}
+# 1. Calculate imputation values from training data only
+employment_median <- median(train_data$person_emp_length, na.rm = TRUE)
+interest_median   <- median(train_data$loan_int_rate, na.rm = TRUE)
+
+# 2. Apply the training medians to both datasets
+train_data$person_emp_length[is.na(train_data$person_emp_length)] <- employment_median
+test_data$person_emp_length[is.na(test_data$person_emp_length)]    <- employment_median
+
+train_data$loan_int_rate[is.na(train_data$loan_int_rate)] <- interest_median
+test_data$loan_int_rate[is.na(test_data$loan_int_rate)]    <- interest_median
+
+# 3. Train Logistic Regression (all other columns are predictors)
+logistic_model <- glm(
+  loan_status ~ .,
+  data = train_data,
+  family = binomial(link = "logit")
+)
+
+# 4. Display model results
+summary(logistic_model)
+
+cat("\nLogistic Regression training completed.\n")
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows:", nrow(test_data), "\n")
+cat("Remaining missing values in training data:", sum(is.na(train_data)), "\n")
+cat("Remaining missing values in testing data:", sum(is.na(test_data)), "\n")
+```
+
+## Evaluate Logistic Regression on test data
+
+`actual_status` and `conf_matrix` are created first, and the confusion-matrix plot and metrics are built from them. In the confusion table, rows are predictions and columns are actual classes, with `"1"` (default) as the positive class.
+
+```{r logistic-evaluate}
+# Predict probability of default (loan_status = 1)
+logistic_prob <- predict(logistic_model, newdata = test_data, type = "response")
+
+# Convert probabilities into class predictions using a 0.5 threshold
+logistic_pred <- factor(ifelse(logistic_prob >= 0.5, "1", "0"), levels = c("0", "1"))
+
+# Actual classes for the test set (used by every later evaluation)
+actual_status <- factor(test_data$loan_status, levels = c("0", "1"))
+
+# Confusion matrix (created BEFORE it is plotted or used for metrics)
+conf_matrix <- confusionMatrix(
+  data = logistic_pred,
+  reference = actual_status,
+  positive = "1"
+)
+
+# Visual confusion matrix - Logistic Regression
+logistic_cm_df <- as.data.frame(conf_matrix$table)
+colnames(logistic_cm_df) <- c("Predicted", "Actual", "Count")
+
+ggplot(logistic_cm_df, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = Count), size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "#DCEBFA", high = "#245A9C") +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  scale_y_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  labs(
+    title = "Confusion Matrix - Logistic Regression",
+    subtitle = "Test Dataset",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+# Calculate evaluation metrics
+cm <- conf_matrix$table
+
+true_negative  <- cm["0", "0"]
+false_negative <- cm["0", "1"]
+false_positive <- cm["1", "0"]
+true_positive  <- cm["1", "1"]
+
+accuracy  <- (true_positive + true_negative) / sum(cm)
+precision <- ifelse(
+  true_positive + false_positive > 0,
+  true_positive / (true_positive + false_positive), 0
+)
+recall <- ifelse(
+  true_positive + false_negative > 0,
+  true_positive / (true_positive + false_negative), 0
+)
+f1_score <- ifelse(
+  precision + recall > 0,
+  2 * precision * recall / (precision + recall), 0
+)
+
+cat("\n--- Logistic Regression Test Metrics ---\n")
+cat("Accuracy :", round(accuracy, 4), "\n")
+cat("Precision:", round(precision, 4), "\n")
+cat("Recall   :", round(recall, 4), "\n")
+cat("F1-score :", round(f1_score, 4), "\n")
+```
+
+## ROC curve and AUC: Logistic Regression
+
+```{r logistic-roc}
+roc_result <- roc(
+  response = actual_status,
+  predictor = logistic_prob,
+  levels = c("0", "1"),
+  direction = "<",
+  quiet = TRUE
+)
+
+auc_value <- as.numeric(auc(roc_result))
+
+cat("Logistic Regression ROC-AUC:", round(auc_value, 4), "\n")
+
+plot(roc_result, main = "ROC Curve - Logistic Regression", col = "blue", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "red")
+```
+
+## Train the Random Forest model
+
+```{r rf-train}
+set.seed(123)
+
+rf_model <- randomForest(
+  loan_status ~ .,
+  data = train_data,
+  ntree = 300,
+  importance = TRUE
+)
+
+print(rf_model)
+
+cat("\nRandom Forest training completed.\n")
+```
+
+## Evaluate Random Forest on test data
+
+As with Logistic Regression, `rf_conf_matrix` is created before it is plotted or used for metrics. The predicted classes (`rf_pred`) come from the forest's majority vote, which can differ very slightly from applying a 0.50 cut-off to `rf_prob` (this is why the threshold table later shows a tiny difference at 0.50).
+
+```{r rf-evaluate}
+# Predicted probability of default and predicted class
+rf_prob <- predict(rf_model, newdata = test_data, type = "prob")[, "1"]
+rf_pred <- factor(
+  as.character(predict(rf_model, newdata = test_data, type = "response")),
+  levels = c("0", "1")
+)
+
+# Confusion matrix (created BEFORE it is plotted or used for metrics)
+rf_conf_matrix <- confusionMatrix(
+  data = rf_pred,
+  reference = actual_status,
+  positive = "1"
+)
+
+# Visual confusion matrix - Random Forest
+rf_cm_df <- as.data.frame(rf_conf_matrix$table)
+colnames(rf_cm_df) <- c("Predicted", "Actual", "Count")
+
+ggplot(rf_cm_df, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = Count), size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "#DCEBFA", high = "#245A9C") +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  scale_y_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  labs(
+    title = "Confusion Matrix - Random Forest",
+    subtitle = "Test Dataset",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+rf_cm <- rf_conf_matrix$table
+
+rf_tn <- rf_cm["0", "0"]
+rf_fn <- rf_cm["0", "1"]
+rf_fp <- rf_cm["1", "0"]
+rf_tp <- rf_cm["1", "1"]
+
+rf_accuracy  <- (rf_tp + rf_tn) / sum(rf_cm)
+rf_precision <- rf_tp / (rf_tp + rf_fp)
+rf_recall    <- rf_tp / (rf_tp + rf_fn)
+rf_f1        <- 2 * rf_precision * rf_recall / (rf_precision + rf_recall)
+
+cat("\n--- Random Forest Test Metrics ---\n")
+cat("Accuracy :", round(rf_accuracy, 4), "\n")
+cat("Precision:", round(rf_precision, 4), "\n")
+cat("Recall   :", round(rf_recall, 4), "\n")
+cat("F1-score :", round(rf_f1, 4), "\n")
+
+rf_roc <- roc(
+  response = actual_status,
+  predictor = rf_prob,
+  levels = c("0", "1"),
+  direction = "<",
+  quiet = TRUE
+)
+
+rf_auc <- as.numeric(auc(rf_roc))
+cat("ROC-AUC  :", round(rf_auc, 4), "\n")
+
+plot(rf_roc, main = "ROC Curve - Random Forest", col = "blue", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "red")
+```
+
+## Model performance comparison
+
+```{r model-comparison}
+model_comparison <- data.frame(
+  Model     = c("Logistic Regression", "Random Forest"),
+  Accuracy  = c(accuracy, rf_accuracy),
+  Precision = c(precision, rf_precision),
+  Recall    = c(recall, rf_recall),
+  F1_Score  = c(f1_score, rf_f1),
+  ROC_AUC   = c(auc_value, rf_auc)
+)
+
+comparison_print <- model_comparison
+comparison_print[, -1] <- round(comparison_print[, -1], 4)
+print(comparison_print, row.names = FALSE)
+
+# Plot comparison
+comparison_long <- data.frame(
+  Model = rep(model_comparison$Model, each = 4),
+  Metric = rep(c("Accuracy", "Precision", "Recall", "F1_Score"), 2),
+  Score = c(
+    accuracy, precision, recall, f1_score,
+    rf_accuracy, rf_precision, rf_recall, rf_f1
+  )
+)
+
+ggplot(comparison_long, aes(x = Metric, y = Score, fill = Model)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Logistic Regression vs Random Forest",
+    x = "Evaluation Metric",
+    y = "Score"
+  ) +
+  ylim(0, 1) +
+  theme_minimal()
+
+# Both ROC curves on one plot
+plot(roc_result, col = "steelblue", lwd = 2,
+     main = "ROC Curves - Logistic Regression vs Random Forest")
+plot(rf_roc, col = "firebrick", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey40")
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Logistic Regression (AUC = ", round(auc_value, 4), ")"),
+    paste0("Random Forest (AUC = ", round(rf_auc, 4), ")")
+  ),
+  col = c("steelblue", "firebrick"), lwd = 2, bty = "n"
+)
+```
+
+## Feature importance of the Random Forest
+
+```{r feature-importance}
+importance_values <- importance(rf_model)
+
+importance_df <- data.frame(
+  Feature = rownames(importance_values),
+  Importance = importance_values[, "MeanDecreaseGini"]
+)
+
+importance_df <- importance_df[order(importance_df$Importance, decreasing = TRUE), ]
+
+print(importance_df, row.names = FALSE)
+
+# Visualize the top 10 important features
+top_features <- head(importance_df, 10)
+
+ggplot(top_features, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Feature Importance - Random Forest",
+    x = "Feature",
+    y = "Mean Decrease in Gini"
+  ) +
+  theme_minimal()
+```
+
+Feature importance shows which variables the forest relied on most; it does not show that a variable causes default.
+
+## Final model validation checks
+
+```{r validation-checks}
+cat("===== FINAL PROJECT VALIDATION =====\n\n")
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows:", nrow(test_data), "\n")
+cat("Missing values in training data:", sum(is.na(train_data)), "\n")
+cat("Missing values in testing data:", sum(is.na(test_data)), "\n")
+
+cat("\nTest prediction count:", length(rf_pred), "\n")
+cat("Actual test labels:", length(actual_status), "\n")
+
+cat("\n===== RANDOM FOREST RESULTS (threshold from majority vote) =====\n")
+cat("Accuracy :", round(rf_accuracy * 100, 2), "%\n")
+cat("Precision:", round(rf_precision * 100, 2), "%\n")
+cat("Recall   :", round(rf_recall * 100, 2), "%\n")
+cat("F1-score :", round(rf_f1, 4), "\n")
+cat("ROC-AUC  :", round(rf_auc, 4), "\n")
+
+stopifnot(
+  sum(is.na(train_data)) == 0,
+  sum(is.na(test_data)) == 0,
+  length(rf_pred) == nrow(test_data),
+  length(rf_prob) == nrow(test_data),
+  identical(levels(actual_status), c("0", "1")),
+  identical(levels(rf_pred), c("0", "1"))
+)
+
+cat("\nAll final validation checks passed.\n")
+```
+
+# Experiments
+
+## Random Forest threshold-tuning experiment
+
+The default decision threshold is 0.50. Lowering it flags more loans as defaults, which usually raises recall and lowers precision.
+
+```{r threshold-tuning}
+thresholds <- c(0.50, 0.45, 0.40, 0.35, 0.30, 0.25, 0.20)
+
+threshold_results <- data.frame()
+
+for (threshold in thresholds) {
+
+  pred <- factor(
+    ifelse(rf_prob >= threshold, "1", "0"),
+    levels = c("0", "1")
+  )
+
+  cm_t <- confusionMatrix(
+    data = pred,
+    reference = actual_status,
+    positive = "1"
+  )
+
+  threshold_results <- rbind(
+    threshold_results,
+    data.frame(
+      Threshold = threshold,
+      Accuracy  = unname(cm_t$overall["Accuracy"]),
+      Precision = unname(cm_t$byClass["Pos Pred Value"]),
+      Recall    = unname(cm_t$byClass["Sensitivity"]),
+      F1        = unname(cm_t$byClass["F1"])
+    )
+  )
+}
+
+print(round(threshold_results, 4), row.names = FALSE)
+
+# Visualize recall and precision trade-off
+threshold_plot <- rbind(
+  data.frame(
+    Threshold = threshold_results$Threshold,
+    Metric = "Recall",
+    Value = threshold_results$Recall
+  ),
+  data.frame(
+    Threshold = threshold_results$Threshold,
+    Metric = "Precision",
+    Value = threshold_results$Precision
+  )
+)
+
+ggplot(threshold_plot, aes(x = Threshold, y = Value, color = Metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_x_reverse(breaks = thresholds) +
+  labs(
+    title = "Random Forest: Threshold Tuning",
+    x = "Probability Threshold",
+    y = "Score",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+> **Limitation:** the threshold of 0.40 was chosen after looking at the **test-set** results above. The 0.40 figures are therefore an experiment, not an unbiased estimate of future performance. A stricter design would choose the threshold on a separate validation set and evaluate it once on an untouched test set.
+
+## Class-weighted Random Forest experiment
+
+```{r class-weighted-rf}
+set.seed(123)
+
+rf_weighted <- randomForest(
+  loan_status ~ .,
+  data = train_data,
+  ntree = 500,
+  importance = TRUE,
+  classwt = c("0" = 1, "1" = 2)
+)
+
+# Default probabilities on the same test set
+rf_weighted_prob <- predict(rf_weighted, newdata = test_data, type = "prob")[, "1"]
+
+# Evaluate using the same 0.5 threshold
+rf_weighted_pred <- factor(
+  ifelse(rf_weighted_prob >= 0.5, "1", "0"),
+  levels = c("0", "1")
+)
+
+weighted_cm <- confusionMatrix(
+  data = rf_weighted_pred,
+  reference = actual_status,
+  positive = "1"
+)
+
+print(weighted_cm)
+
+cat("\nClass-Weighted Random Forest Metrics\n")
+cat("Accuracy :", round(weighted_cm$overall["Accuracy"], 4), "\n")
+cat("Precision:", round(weighted_cm$byClass["Pos Pred Value"], 4), "\n")
+cat("Recall   :", round(weighted_cm$byClass["Sensitivity"], 4), "\n")
+cat("F1-score :", round(weighted_cm$byClass["F1"], 4), "\n")
+```
+
+## Small category counts
+
+Some categories are small, so their default rates are less reliable.
+
+```{r small-categories}
+cat("\nLoan Grade Counts:\n")
+print(table(loan_clean$loan_grade))
+
+cat("\nHome Ownership Counts:\n")
+print(table(loan_clean$person_home_ownership))
+
+cat("\nDefault Rates by Loan Grade (%):\n")
+print(round(
+  prop.table(table(loan_clean$loan_grade, loan_clean$loan_status), margin = 1)[, "1"] * 100,
+  2
+))
+
+cat("\nDefault Rates by Home Ownership (%):\n")
+print(round(
+  prop.table(
+    table(loan_clean$person_home_ownership, loan_clean$loan_status),
+    margin = 1
+  )[, "1"] * 100,
+  2
+))
+```
+
+## Random Forest evaluation at threshold 0.40
+
+```{r rf-threshold-040}
+chosen_threshold <- 0.40
+
+rf_tuned_pred <- factor(
+  ifelse(rf_prob >= chosen_threshold, "1", "0"),
+  levels = c("0", "1")
+)
+
+rf_tuned_cm <- confusionMatrix(
+  data = rf_tuned_pred,
+  reference = actual_status,
+  positive = "1"
+)
+
+print(rf_tuned_cm)
+
+# Confusion matrix as a visual plot
+rf_tuned_df <- as.data.frame(rf_tuned_cm$table)
+colnames(rf_tuned_df) <- c("Predicted", "Actual", "Count")
+
+ggplot(rf_tuned_df, aes(x = Actual, y = Predicted, fill = Count)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = Count), size = 8, fontface = "bold") +
+  scale_fill_gradient(low = "#DCEBFA", high = "#245A9C") +
+  scale_x_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  scale_y_discrete(labels = c("0" = "Non-Default", "1" = "Default")) +
+  labs(
+    title = "Random Forest - Tuned Threshold (0.40)",
+    x = "Actual Class",
+    y = "Predicted Class",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid = element_blank()
+  )
+
+cat("\nThreshold:", chosen_threshold, "\n")
+cat("Accuracy         :", round(rf_tuned_cm$overall["Accuracy"], 4), "\n")
+cat("Precision        :", round(rf_tuned_cm$byClass["Pos Pred Value"], 4), "\n")
+cat("Recall           :", round(rf_tuned_cm$byClass["Sensitivity"], 4), "\n")
+cat("F1-score         :", round(rf_tuned_cm$byClass["F1"], 4), "\n")
+cat("Balanced accuracy:", round(rf_tuned_cm$byClass["Balanced Accuracy"], 4), "\n")
+```
+
+## Reported results vs results from this knit
+
+The "Reported" columns are the figures from the original project run. The "This knit" columns are computed live above. Small differences can occur with different R or package versions.
+
+```{r reported-vs-live}
+reported_vs_live <- data.frame(
+  Model = c("Logistic Regression", "Random Forest (0.50)", "Random Forest (0.40)"),
+  Reported_Accuracy  = c(0.8619, 0.9375, 0.9364),
+  Knit_Accuracy      = c(accuracy, rf_accuracy, unname(rf_tuned_cm$overall["Accuracy"])),
+  Reported_Precision = c(0.7554, 0.9765, 0.9467),
+  Knit_Precision     = c(precision, rf_precision, unname(rf_tuned_cm$byClass["Pos Pred Value"])),
+  Reported_Recall    = c(0.5448, 0.7318, 0.7516),
+  Knit_Recall        = c(recall, rf_recall, unname(rf_tuned_cm$byClass["Sensitivity"])),
+  Reported_F1        = c(0.6330, 0.8366, 0.8379),
+  Knit_F1            = c(f1_score, rf_f1, unname(rf_tuned_cm$byClass["F1"])),
+  Reported_AUC       = c(0.8639, 0.9384, NA),
+  Knit_AUC           = c(auc_value, rf_auc, NA)
+)
+
+reported_vs_live[, -1] <- round(reported_vs_live[, -1], 4)
+print(reported_vs_live, row.names = FALSE)
+```
+
+# LIME Explainability
+
+LIME fits a simple local model around one test applicant to show which feature ranges pushed the Random Forest towards "default" for that case. Two small S3 methods tell `lime` how to treat a `randomForest` model and how to obtain class probabilities (columns named `"0"` and `"1"`). A seed is set so the explanation can be repeated; LIME samples randomly, so the numbers can still differ slightly between package versions.
+
+
+```{r lime-explain}
+# Tell lime how to handle a randomForest classification model
+model_type.randomForest <- function(x, ...) {
+  "classification"
+}
+
+predict_model.randomForest <- function(x, newdata, type, ...) {
+  probabilities <- predict(x, newdata = newdata, type = "prob")
+  as.data.frame(probabilities, check.names = FALSE)
+}
+
+# Register methods for the lime package
+registerS3method(
+  "model_type",
+  "randomForest",
+  model_type.randomForest,
+  envir = asNamespace("lime")
+)
+
+registerS3method(
+  "predict_model",
+  "randomForest",
+  predict_model.randomForest,
+  envir = asNamespace("lime")
+)
+
+# Prepare training features (exclude target)
+lime_train <- train_data[
+  , setdiff(names(train_data), "loan_status"),
+  drop = FALSE
+]
+
+# Create LIME explainer
+lime_explainer <- lime::lime(
+  x = lime_train,
+  model = rf_model,
+  bin_continuous = TRUE,
+  n_bins = 4,
+  quantile_bins = TRUE
+)
+
+# Select the first test applicant predicted as default
+default_cases <- which(as.character(rf_pred) == "1")
+
+if (length(default_cases) == 0) {
+  stop("No applicants predicted as default. Check rf_pred.")
+}
+
+case_index <- default_cases[1]
+
+# Extract applicant features (exclude target)
+applicant <- test_data[
+  case_index,
+  setdiff(names(test_data), "loan_status"),
+  drop = FALSE
+]
+
+# Check predicted class probabilities
+check_probs <- predict_model.randomForest(
+  rf_model,
+  applicant,
+  type = "prob"
+)
+
+print(check_probs)
+
+if (!all(c("0", "1") %in% names(check_probs))) {
+  stop("Expected probability columns named '0' and '1'.")
+}
+
+# Generate LIME explanation for the default class
+set.seed(123)
+
+lime_explanation <- lime::explain(
+  x = applicant,
+  explainer = lime_explainer,
+  n_features = 6,
+  labels = "1"
+)
+
+# Display explanation results
+lime_results <- as.data.frame(lime_explanation)
+
+print(
+  lime_results[
+    ,
+    c(
+      "feature",
+      "feature_value",
+      "feature_desc",
+      "feature_weight",
+      "label_prob",
+      "model_r2"
+    ),
+    drop = FALSE
+  ]
+)
+
+# Plot influential features
+plot_features(lime_explanation)
+
+# Display prediction and actual outcome
+cat("Applicant index:", case_index, "\n")
+cat("Predicted class:", as.character(rf_pred[case_index]), "\n")
+cat("Actual class:", as.character(actual_status[case_index]), "\n")
+```
+
+
+The original run reported a model probability of about 0.88 for this case and a LIME explanation fit (`model_r2`) of about 0.14, which is low. A low fit means the local linear model explains little of the forest's behaviour around this applicant, so the individual feature contributions should be read cautiously.
+
+# Conclusion
+
+**Data preparation.** The original file has 32,581 rows and 12 variables. After removing 165 duplicate rows and a few invalid records (ages above 100 and employment lengths above 50 years), 32,409 rows remain. Default cases make up 7,088 rows (21.87%), so the classes are imbalanced. A stratified 80:20 split gives 25,928 training and 6,481 test records, and missing values in the models are filled with training-set medians.
+
+**Exploratory and statistical findings.** Default rates differ across loan grades, loan purposes, home-ownership groups and previous-default history, and the chi-square tests found a statistically significant association between each categorical variable and loan status. These are associations, not causal relationships.
+
+**Baseline model comparison (reported results).**
+
+| Model | Accuracy | Precision | Recall | F1-score | ROC-AUC |
+|---|---:|---:|---:|---:|---:|
+| Logistic Regression | 86.19% | 75.54% | 54.48% | 0.6330 | 0.8639 |
+| Random Forest (threshold 0.50) | 93.75% | 97.65% | 73.18% | 0.8366 | 0.9384 |
+
+Random Forest outperformed Logistic Regression on every reported metric.
+
+**Threshold-tuning experiment.** At a threshold of 0.40 the Random Forest reported 93.64% accuracy, 94.67% precision, 75.16% recall, an F1-score of 0.8379 and 86.99% balanced accuracy (confusion matrix: TN = 5,004, FP = 60, FN = 352, TP = 1,065). Compared with 0.50, it catches more defaults at the cost of more false positives. The 0.40 threshold was selected after examining test-set results, so this is an experiment rather than an unbiased final estimate.
+
+**Class-weighted Random Forest.** Giving the default class a weight of 2 did not improve recall in the reported run (about 72.6% versus 73.2% at the baseline).
+
+**LIME.** LIME was applied to one test applicant who was predicted as default and was an actual default. Its explanation fit was low, so the explanation is only indicative.
+
+## Limitations and future work
+
+- Default cases are about 21.87% of the cleaned data, so class imbalance remains relevant.
+- Loan grade G contains 64 records and the `OTHER` home-ownership group contains 106 records; findings for these small groups need caution.
+- Threshold selection used the test set; it should be done on a validation set in future work.
+- Associations, feature importance and LIME explanations do not establish causal root causes.
+- The LIME example had a low explanation fit.
+- Results depend on this dataset and one random split, and may not generalise to other lending populations or time periods.
+- Future work: validation-based threshold selection, cross-validation, other imbalance-handling methods, and testing on new data.
+
+# Dataset Source and Project Repository
+
+- **Dataset:** Credit Risk Dataset (`credit_risk_dataset.csv`) - <https://www.kaggle.com/datasets/laotse/credit-risk-dataset>
+- **GitHub repository:** <https://github.com/Gautam-2107/Loan-Default-Risk-Analysis>
+
+
+# Reproducibility Instructions
+
+1. Download or clone the project folder so that `Loan_Default_Risk_Analysis_Final.Rmd` and `credit_risk_dataset.csv` are in the **same folder**.
+2. Open `Loan_Default_Risk_Analysis_Final.Rmd` in RStudio.
+3. Make sure these R packages are installed (the first chunk installs any that are missing, which needs an internet connection): `dplyr`, `ggplot2`, `corrplot`, `caret`, `pROC`, `randomForest`, `lime`.
+4. Click **Knit > Knit to HTML**. The output `Loan_Default_Risk_Analysis_Final.html` is created next to the `.Rmd` file.
+5. Random seeds are fixed (`set.seed(123)`) before the train-test split, each Random Forest and the LIME explanation, so a re-run with the same R and package versions should reproduce the same results. Training the two Random Forests can take a few minutes.
+
